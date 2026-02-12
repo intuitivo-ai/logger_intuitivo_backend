@@ -10,8 +10,8 @@ defmodule LoggerIntuitivoBackend do
   @behaviour :gen_event
 
   @default_format "$date $time [$level] $metadata $message\n"
-  @default_buffer_size 20
-  @default_max_message_bytes 256 * 1024
+  @default_buffer_size 8
+  @default_max_message_bytes 8 * 1024
   @default_throttle_window_ms 60_000
   @default_throttle_max_repeats 3
   @default_verbose_file "/root/verbose.txt"
