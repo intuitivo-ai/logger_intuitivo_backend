@@ -107,23 +107,15 @@ defmodule LoggerIntuitivoBackend do
   defp throttle_summary?(output), do: String.starts_with?(output, @throttle_summary_prefix)
 
   defp expire_throttle(state) do
-    %{throttle_map: throttle_map, throttle_window_ms: window_ms, socket_module: socket_module} =
-      state
+    %{throttle_map: throttle_map, throttle_window_ms: window_ms} = state
 
     now = :os.system_time(:millisecond)
-    expired = Enum.filter(throttle_map, fn {_k, {_count, first_ts, _msg}} -> now - first_ts > window_ms end)
-    new_map = Map.drop(throttle_map, Enum.map(expired, &elem(&1, 0)))
+    expired_keys =
+      throttle_map
+      |> Enum.filter(fn {_k, {_count, first_ts, _msg}} -> now - first_ts > window_ms end)
+      |> Enum.map(&elem(&1, 0))
 
-    state =
-      Enum.reduce(expired, %{state | throttle_map: new_map}, fn {_key, {count, _first_ts, _msg}}, acc ->
-        if count > 1 do
-          summary = "#{@throttle_summary_prefix} Previous message repeated #{count} times"
-          send_system(socket_module, summary)
-        end
-        acc
-      end)
-
-    state
+    %{state | throttle_map: Map.drop(throttle_map, expired_keys)}
   end
 
   defp throttle_check(output, state) do
