@@ -55,10 +55,11 @@ defmodule LoggerIntuitivoBackendTest do
   end
 
   test "init and configure verbose", %{agent: agent} do
+    Logger.configure_backend(@backend, verbose: false)
     # Sync: ensure backend has processed config (send immediate, wait for it)
     Logger.info("HEALTH_CHECK sync")
     assert get_sent(agent, 1000) != [], "backend should be configured"
-    # Default: no verbose, so logs are buffered until buffer_size
+    # No verbose: logs are buffered until buffer_size
     clear_sent(agent)
     Logger.info("one")
     Logger.info("two")
