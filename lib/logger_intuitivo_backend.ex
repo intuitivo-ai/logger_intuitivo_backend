@@ -218,8 +218,8 @@ defmodule LoggerIntuitivoBackend do
     else
       suffix = "\n... [truncated]"
       keep = max_bytes - byte_size(suffix)
-      <<_::binary-size(byte_size(combined) - keep), rest::binary>> = combined
-      rest <> suffix
+      <<head::binary-size(keep), _::binary>> = combined
+      head <> suffix
     end
   end
 
@@ -241,12 +241,12 @@ defmodule LoggerIntuitivoBackend do
 
     if not is_nil(socket_module) do
       if buf_fw != [] do
-        combined = combine_and_truncate(Enum.reverse(buf_fw), max_bytes)
+        combined = combine_and_truncate(buf_fw, max_bytes)
         socket_module.send_log({combined, random_id()})
       end
 
       if buf_sys != [] do
-        combined = combine_and_truncate(Enum.reverse(buf_sys), max_bytes)
+        combined = combine_and_truncate(buf_sys, max_bytes)
         send_system(socket_module, combined)
       end
     end

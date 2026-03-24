@@ -138,4 +138,55 @@ defmodule LoggerIntuitivoBackendTest do
     assert msg =~ "info"
     assert msg =~ "formatted"
   end
+
+  test "truncation keeps the beginning of the message, not the end", %{agent: agent} do
+    # Use a tiny max_message_bytes to force truncation of two combined firmware logs
+    long_a = String.duplicate("A", 60)
+    long_b = String.duplicate("B", 60)
+
+    Logger.configure_backend(@backend, max_message_bytes: 80, buffer_size: 2, verbose: false)
+    clear_sent(agent)
+
+    Logger.info("In2Firmware #{long_a}")
+    Logger.info("In2Firmware #{long_b}")
+
+    sent = get_sent(agent, 2000)
+    assert length(sent) >= 1, "expected at least one sent message"
+    {_type, combined} = List.first(sent)
+
+    assert String.contains?(combined, "In2Firmware"),
+           "beginning of message should be preserved, got: #{inspect(combined)}"
+
+    assert String.ends_with?(combined, "[truncated]"),
+           "expected truncation marker at the end, got: #{inspect(combined)}"
+
+    refute String.contains?(combined, long_b),
+           "end content (BBBs) should be truncated, got: #{inspect(combined)}"
+  end
+
+  test "flush_buffers preserves chronological order", %{agent: agent} do
+    Logger.configure_backend(@backend, buffer_size: 10, verbose: false)
+    clear_sent(agent)
+
+    Logger.info("In2Firmware FIRST")
+    Logger.info("In2Firmware SECOND")
+    Logger.info("In2Firmware THIRD")
+
+    # Logger.flush/0 sends the :flush event to all backends
+    Logger.flush()
+
+    sent = get_sent(agent, 2000)
+    assert length(sent) >= 1, "expected at least one sent message after flush"
+    {_type, combined} = List.first(sent)
+
+    first_pos = :binary.match(combined, "FIRST") |> elem(0)
+    second_pos = :binary.match(combined, "SECOND") |> elem(0)
+    third_pos = :binary.match(combined, "THIRD") |> elem(0)
+
+    assert first_pos < second_pos,
+           "FIRST should appear before SECOND in combined output"
+
+    assert second_pos < third_pos,
+           "SECOND should appear before THIRD in combined output"
+  end
 end
