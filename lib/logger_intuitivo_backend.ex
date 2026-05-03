@@ -6,12 +6,34 @@ defmodule LoggerIntuitivoBackend do
   Logger backend that sends logs through the firmware Socket (e.g. to CloudWatch).
   Supports verbose mode, buffering with size limit, throttling of repeated messages,
   and configurable filters (exclude SQUASHFS, immediate health check).
+
+  ## Verbose off (buffered mode)
+
+  - **`verbose: true`**: each matching log is sent immediately (firmware lines via
+    `send_log/1`, others via `send_system/1` when the socket supports it).
+  - **`verbose: false`**: lines are batched. A batch is sent when **either**:
+    1. The joined payload would reach or exceed **`max_message_bytes`**, or
+    2. The buffer holds **`max_buffer_lines`** lines (hard cap so very short lines
+       cannot grow without bound).
+
+  Reaching **`buffer_size`** lines alone **does not** send anything if the joined
+  size is still under **`max_message_bytes`**: many short lines keep accumulating
+  until the byte limit or **`max_buffer_lines`** is reached. Use `Logger.flush/0`
+  to force-send whatever is pending (e.g. before shutdown).
+
+  **`buffer_size`** is kept for configuration compatibility and for deriving the
+  default **`max_buffer_lines`** when you omit it; it is **not** a flush trigger.
+
+  Before send, **similar** lines in the same batch are collapsed to a single line
+  (same *similarity fingerprint*: timestamp-stripped body, numbers normalized to `#`).
   """
   @behaviour :gen_event
 
   @default_format "$date $time [$level] $metadata $message\n"
   @default_buffer_size 8
   @default_max_message_bytes 8 * 1024
+  # Hard line cap when many short lines never reach max_message_bytes.
+  @default_max_buffer_lines 128
   @default_throttle_window_ms 60_000
   @default_throttle_max_repeats 3
   @default_verbose_file "/root/verbose.txt"
@@ -186,25 +208,90 @@ defmodule LoggerIntuitivoBackend do
   end
 
   defp maybe_flush_firmware_buffer(new_buf, state) do
-    %{buffer_size: max_len, max_message_bytes: max_bytes, socket_module: socket_module} = state
-    if length(new_buf) >= max_len and not is_nil(socket_module) do
-      combined = combine_and_truncate(new_buf, max_bytes)
-      socket_module.send_log({combined, random_id()})
-      %{state | buffer_logs_firmware: []}
-    else
+    %{socket_module: socket_module} = state
+
+    if is_nil(socket_module) or new_buf == [] do
       %{state | buffer_logs_firmware: new_buf}
+    else
+      if should_flush_buffer?(new_buf, state) do
+        combined = combine_buffer_for_send(new_buf, state.max_message_bytes)
+        socket_module.send_log({combined, random_id()})
+        %{state | buffer_logs_firmware: []}
+      else
+        %{state | buffer_logs_firmware: new_buf}
+      end
     end
   end
 
   defp maybe_flush_system_buffer(new_buf, state) do
-    %{buffer_size: max_len, max_message_bytes: max_bytes, socket_module: socket_module} = state
-    if length(new_buf) >= max_len and not is_nil(socket_module) do
-      combined = combine_and_truncate(new_buf, max_bytes)
-      send_system(socket_module, combined)
-      %{state | buffer_logs_system: []}
-    else
+    %{socket_module: socket_module} = state
+
+    if is_nil(socket_module) or new_buf == [] do
       %{state | buffer_logs_system: new_buf}
+    else
+      if should_flush_buffer?(new_buf, state) do
+        combined = combine_buffer_for_send(new_buf, state.max_message_bytes)
+        send_system(socket_module, combined)
+        %{state | buffer_logs_system: []}
+      else
+        %{state | buffer_logs_system: new_buf}
+      end
     end
+  end
+
+  # new_buf: newest line first (prepended in do_send).
+  # Only byte size or the line cap flush — never line count alone (e.g. buffer_size),
+  # so many short lines keep accumulating until max_message_bytes or max_buffer_lines.
+  defp should_flush_buffer?(new_buf, state) do
+    %{max_buffer_lines: cap_lines, max_message_bytes: max_bytes} = state
+    n = length(new_buf)
+    raw_bytes = buffer_joined_byte_size(new_buf)
+
+    raw_bytes >= max_bytes or n >= cap_lines
+  end
+
+  defp buffer_joined_byte_size(lines) do
+    lines
+    |> Enum.reverse()
+    |> Enum.join("\n")
+    |> byte_size()
+  end
+
+  defp combine_buffer_for_send(lines, max_bytes) do
+    lines
+    |> dedupe_similar_lines()
+    |> combine_and_truncate(max_bytes)
+  end
+
+  @doc false
+  # Collapse lines in the same batch that look the same (timestamp / numbers differ).
+  # Keeps the first occurrence in chronological order (oldest kept). Returns newest-first
+  # (same convention as the internal buffers) for `combine_and_truncate/2`.
+  def dedupe_similar_lines(lines_newest_first) when is_list(lines_newest_first) do
+    kept_oldest_first =
+      lines_newest_first
+      |> Enum.reverse()
+      |> Enum.reduce({[], MapSet.new()}, fn line, {acc, seen} ->
+        fp = line_similarity_fingerprint(line)
+
+        if MapSet.member?(seen, fp) do
+          {acc, seen}
+        else
+          {acc ++ [line], MapSet.put(seen, fp)}
+        end
+      end)
+      |> elem(0)
+
+    Enum.reverse(kept_oldest_first)
+  end
+
+  defp line_similarity_fingerprint(line) when is_binary(line) do
+    line
+    |> String.replace(~r/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+/, " ")
+    |> String.replace(~r/\bpid[= ]#?\d+/i, "pid=#")
+    |> String.replace(~r/\b(?:0x[0-9a-fA-F]{4,})\b/u, "#")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
   end
 
   defp combine_and_truncate(lines, max_bytes) do
@@ -241,12 +328,12 @@ defmodule LoggerIntuitivoBackend do
 
     if not is_nil(socket_module) do
       if buf_fw != [] do
-        combined = combine_and_truncate(buf_fw, max_bytes)
+        combined = combine_buffer_for_send(buf_fw, max_bytes)
         socket_module.send_log({combined, random_id()})
       end
 
       if buf_sys != [] do
-        combined = combine_and_truncate(buf_sys, max_bytes)
+        combined = combine_buffer_for_send(buf_sys, max_bytes)
         send_system(socket_module, combined)
       end
     end
@@ -300,6 +387,7 @@ defmodule LoggerIntuitivoBackend do
       buffer_logs_system: [],
       buffer_size: @default_buffer_size,
       max_message_bytes: @default_max_message_bytes,
+      max_buffer_lines: @default_max_buffer_lines,
       throttle_enabled: true,
       throttle_window_ms: @default_throttle_window_ms,
       throttle_max_repeats: @default_throttle_max_repeats,
@@ -323,10 +411,25 @@ defmodule LoggerIntuitivoBackend do
     format = Logger.Formatter.compile(format_opts)
     metadata_filter = Keyword.get(opts, :metadata_filter)
     metadata_reject = Keyword.get(opts, :metadata_reject)
-    verbose = Map.get(state, :verbose, false)
-    socket_module = Keyword.get(opts, :socket_module)
-    buffer_size = Keyword.get(opts, :buffer_size, @default_buffer_size)
-    max_message_bytes = Keyword.get(opts, :max_message_bytes, @default_max_message_bytes)
+
+    # Must read from merged opts so Logger.configure_backend(..., verbose: false) applies;
+    # otherwise a prior :verbose true sticks in state and system logs bypass the buffer.
+    verbose = Keyword.get(opts, :verbose, Map.get(state, :verbose, false))
+
+    socket_module =
+      Keyword.get(opts, :socket_module) || Map.get(state, :socket_module)
+    buffer_size =
+      Keyword.get(opts, :buffer_size) ||
+        Map.get(state, :buffer_size, @default_buffer_size)
+
+    max_message_bytes =
+      Keyword.get(opts, :max_message_bytes) ||
+        Map.get(state, :max_message_bytes, @default_max_message_bytes)
+
+    max_buffer_lines =
+      Keyword.get(opts, :max_buffer_lines) ||
+        Map.get(state, :max_buffer_lines) ||
+        max(max(@default_max_buffer_lines, buffer_size * 4), buffer_size)
     throttle_enabled = Keyword.get(opts, :throttle_enabled, true)
     throttle_window_sec = Keyword.get(opts, :throttle_window_sec, div(@default_throttle_window_ms, 1000))
     throttle_window_ms = throttle_window_sec * 1000
@@ -347,6 +450,7 @@ defmodule LoggerIntuitivoBackend do
         socket_module: socket_module,
         buffer_size: buffer_size,
         max_message_bytes: max_message_bytes,
+        max_buffer_lines: max_buffer_lines,
         throttle_enabled: throttle_enabled,
         throttle_window_ms: throttle_window_ms,
         throttle_max_repeats: throttle_max_repeats,

@@ -18,7 +18,8 @@ defmodule LoggerIntuitivoBackendTest do
       throttle_enabled: true,
       throttle_window_sec: 2,
       throttle_max_repeats: 2,
-      buffer_size: 3,
+      buffer_size: 8,
+      max_buffer_lines: 128,
       max_message_bytes: 1024,
       exclude_message_containing: ["SQUASHFS error"],
       immediate_send_containing: ["HEALTH_CHECK"]
@@ -59,13 +60,13 @@ defmodule LoggerIntuitivoBackendTest do
     # Sync: ensure backend has processed config (send immediate, wait for it)
     Logger.info("HEALTH_CHECK sync")
     assert get_sent(agent, 1000) != [], "backend should be configured"
-    # No verbose: logs are buffered until buffer_size
+    # No verbose: short lines stay buffered until byte cap, line cap, or Logger.flush/0
     clear_sent(agent)
     Logger.info("one")
     Logger.info("two")
     assert get_sent(agent, 100) == []
     Logger.info("three")
-    # Buffer of 3 reached for system logs; allow time for backend to flush
+    Logger.flush()
     sent = get_sent(agent, 2000)
     assert length(sent) >= 1, "expected at least one sent message, got: #{inspect(sent)}"
   end
@@ -98,13 +99,14 @@ defmodule LoggerIntuitivoBackendTest do
     assert msg =~ "HEALTH_CHECK"
   end
 
-  test "buffer flushes when buffer_size reached", %{agent: agent} do
+  test "buffer sends batched lines after Logger.flush when under byte and line caps", %{agent: agent} do
     Logger.configure_backend(@backend, verbose: false)
     clear_sent(agent)
     Logger.info("buf1")
     Logger.info("buf2")
     assert get_sent(agent, 100) == []
     Logger.info("buf3")
+    Logger.flush()
     sent = get_sent(agent, 2000)
     assert length(sent) >= 1, "expected at least one sent message, got: #{inspect(sent)}"
     # Combined message should contain the three lines
@@ -144,7 +146,11 @@ defmodule LoggerIntuitivoBackendTest do
     long_a = String.duplicate("A", 60)
     long_b = String.duplicate("B", 60)
 
-    Logger.configure_backend(@backend, max_message_bytes: 80, buffer_size: 2, verbose: false)
+    Logger.configure_backend(@backend,
+      max_message_bytes: 80,
+      buffer_size: 8,
+      verbose: false
+    )
     clear_sent(agent)
 
     Logger.info("In2Firmware #{long_a}")
@@ -165,7 +171,7 @@ defmodule LoggerIntuitivoBackendTest do
   end
 
   test "flush_buffers preserves chronological order", %{agent: agent} do
-    Logger.configure_backend(@backend, buffer_size: 10, verbose: false)
+    Logger.configure_backend(@backend, buffer_size: 10, max_buffer_lines: 10, verbose: false)
     clear_sent(agent)
 
     Logger.info("In2Firmware FIRST")
@@ -188,5 +194,49 @@ defmodule LoggerIntuitivoBackendTest do
 
     assert second_pos < third_pos,
            "SECOND should appear before THIRD in combined output"
+  end
+
+  test "dedupe_similar_lines keeps one line when timestamps differ", _ do
+    a = "2025-05-03 10:00:00.000 [info] In2Firmware ping pid=111"
+    b = "2025-05-03 10:00:01.000 [info] In2Firmware ping pid=222"
+
+    out = LoggerIntuitivoBackend.dedupe_similar_lines([b, a])
+    assert length(out) == 1
+  end
+
+  test "many short lines past buffer_size stay buffered until byte cap or flush", %{agent: agent} do
+    Logger.configure_backend(@backend,
+      verbose: false,
+      buffer_size: 3,
+      max_buffer_lines: 500,
+      max_message_bytes: 50_000
+    )
+
+    clear_sent(agent)
+    for i <- 1..20, do: Logger.info("short #{i}")
+    assert get_sent(agent, 200) == []
+    Logger.flush()
+    assert length(get_sent(agent, 2000)) >= 1
+  end
+
+  test "verbose off flushes on max_message_bytes before max_buffer_lines", %{agent: agent} do
+    Logger.configure_backend(@backend,
+      verbose: false,
+      buffer_size: 4,
+      max_buffer_lines: 50,
+      max_message_bytes: 180
+    )
+
+    clear_sent(agent)
+    # Distinct messages so dedupe does not shrink byte count before the byte threshold.
+    for i <- 1..5 do
+      Logger.info("In2Firmware " <> String.duplicate("x", 30) <> " u=" <> String.duplicate("a", i))
+    end
+
+    sent = get_sent(agent, 3000)
+    assert length(sent) >= 1
+    {_type, combined} = List.first(sent)
+    assert byte_size(combined) <= 180 + 50
+    assert combined =~ "In2Firmware"
   end
 end
